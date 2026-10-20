@@ -105,11 +105,16 @@ jobs:
           ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ vars.FLYDSL_REVIEW_MODEL }}
           ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.FLYDSL_REVIEW_MODEL }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           export TMPDIR="${TMPDIR:-/tmp}/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$TMPDIR"
           echo "REVIEW_TMP=$TMPDIR" >> "$GITHUB_ENV"
-          bash .claude/skills/review-pr/run_one.sh "$PR" "$GITHUB_REPOSITORY"
+          # Rehearsal only: a stand-in for run_one.sh that writes a card and succeeds.
+          w=$(mktemp -d "$TMPDIR/review-pr-XXXXXX")
+          printf '## FlyDSL PR #%s - rehearsal\n\n**Stand-in card written by the rehearsal, not by a model.**\n\nReview (advisory): NO FINDINGS\n' "$PR" > "$w/card.md"
+          printf '{"headRefOid": "%s"}\n' "$HEAD_SHA" > "$w/pr_meta.json"
+          echo "worker: stand-in" > "$w/usage.txt"
 
       - name: Stop the gateway container
         if: always()
