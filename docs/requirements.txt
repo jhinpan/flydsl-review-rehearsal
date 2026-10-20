@@ -1,0 +1,3 @@
+# Compatibility entry point for local and GitHub Pages builds. Keep the
+# dependency graph in one place so those builds match Read the Docs exactly.
+-r sphinx/requirements.txt

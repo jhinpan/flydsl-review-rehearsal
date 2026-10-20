@@ -1,0 +1,77 @@
+# Build directories
+build/
+build_*/
+build-*/
+cmake-build-*/
+
+# GPU core dumps
+gpucore.*
+
+# git 
+*.log
+*.diff
+
+# Python
+__pycache__/
+python/flydsl/_version.py
+.ruff_cache/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+dist/
+.eggs/
+lib/python*/site-packages/
+
+# Virtualenvs
+env/
+venv/
+.env
+.venv/
+.venv*/
+.venvs/
+
+# C++
+.cache/
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# IDE
+.vscode/
+.cursor/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled files
+*.o
+*.so
+*.dylib
+*.dll
+*.obj
+*.a
+*.s
+*.asm
+*.hasco
+*.cubin
+*.ptx
+
+# Temporary files
+/tmp/
+*.tmp
+
+# MACOS
+.DS_Store
+Thumbs.db
+
+# Sphinx documentation build
+docs/_build/
+python/flydsl/_mlir
+_toc.yml
+
+# Agent
+.claude/worktrees/
+.codex/worktrees/

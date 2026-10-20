@@ -1,0 +1,267 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+
+from typing import List, Tuple
+
+from ...runtime.device import get_rocm_arch, get_warp_size
+from ...utils import env
+from .base import AOTRuntimeConfig, BaseBackend, GPUTarget
+
+
+def _ktrace_tracing_enabled(compile_hints: dict) -> bool:
+    if "ktrace" in compile_hints:
+        return bool(compile_hints["ktrace"])
+    return bool(env.ktrace.enable)
+
+
+class RocmBackend(BaseBackend):
+    """ROCm / AMDGPU compile backend (HIP runtime, ROCDL lowering)."""
+
+    @staticmethod
+    def supports_target(target: GPUTarget) -> bool:
+        return target.backend == "rocm"
+
+    @classmethod
+    def ktrace_backend(cls):
+        from ._rocm_ktrace import ROCM_KTRACE_BACKEND
+
+        return ROCM_KTRACE_BACKEND
+
+    @staticmethod
+    def detect_target() -> GPUTarget:
+        arch = env.compile.arch or get_rocm_arch()
+        return GPUTarget(backend="rocm", arch=arch, warp_size=get_warp_size(arch))
+
+    @classmethod
+    def make_target(cls, arch: str) -> GPUTarget:
+        return GPUTarget(backend="rocm", arch=arch, warp_size=get_warp_size(arch))
+
+    @classmethod
+    def llvm_address_space(cls, address_space) -> int:
+        """Map an address space to its AMDGPU LLVM representation."""
+        from ..._mlir.dialects.fly import AddressSpace
+
+        mapping = {
+            AddressSpace.Generic: 0,
+            AddressSpace.Global: 1,
+            AddressSpace.Shared: 3,
+            AddressSpace.Register: 5,
+        }
+        try:
+            return mapping[address_space]
+        except KeyError:
+            raise ValueError(f"ROCm address space {address_space} does not lower to a bare LLVM pointer") from None
+
+    # -- compile pipeline ------------------------------------------------
+
+    @staticmethod
+    def _format_pass_opts(opts: dict) -> str:
+        """Format {key: value, ...} as 'key=value key2=value2' for MLIR pass options."""
+        return " ".join(f"{k}={v}" for k, v in opts.items())
+
+    def _pipeline_parts(self, *, compile_hints: dict) -> Tuple[List[str], str]:
+        chip = self.target.arch
+
+        # ROCDL never reads gpu-module-to-binary's opts=, so nothing may be
+        # routed through it.
+        bin_cli_opts = []
+
+        rocdl_opts = {
+            "O": 2,
+            "abi": 600,
+            "chip": chip,
+            "correct-sqrt": "true",
+            "daz": "false",
+            "fast": "true" if compile_hints.get("fast_fp_math") else "false",
+            "features": "",
+            "finite-only": "false",
+            "module": "",
+            "triple": "amdgcn-amd-amdhsa",
+            "unsafe-math": "true" if compile_hints.get("unsafe_fp_math") else "false",
+            "wave64": "true" if get_warp_size(chip) == 64 else "false",
+        }
+
+        ktrace_fragments = []
+        if _ktrace_tracing_enabled(compile_hints):
+            ktrace_fragments = ["convert-fly-ktrace-to-rocdl"]
+
+        pre_binary_fragments = [
+            "fly-rewrite-func-signature",
+            "fly-canonicalize",
+            "fly-rocdl-expand-ops",
+            "fly-layout-lowering",
+            "fly-int-swizzle-simplify",
+            "canonicalize",
+            "fly-convert-atom-call-to-ssa-form",
+            "fly-promote-regmem-to-vectorssa",
+            *ktrace_fragments,
+            "convert-fly-to-rocdl",
+            "canonicalize",
+            f"gpu.module(convert-scf-to-cf,cse,"
+            f"convert-rocdl-fastmath-ops,"
+            f"convert-gpu-to-rocdl{{chipset={chip} index-bitwidth=0 runtime=HIP use-bare-ptr-memref-call-conv=true}},"
+            f"fly-rocdl-cluster-attr)",
+        ]
+        binary_prep_fragments = [
+            f"rocdl-attach-target{{{self._format_pass_opts(rocdl_opts)}}}",
+            "convert-scf-to-cf",
+            "convert-cf-to-llvm",
+            "gpu-to-llvm{use-bare-pointers-for-host=true use-bare-pointers-for-kernels=true}",
+            "convert-vector-to-llvm",
+            "convert-arith-to-llvm",
+            "convert-func-to-llvm",
+            "reconcile-unrealized-casts",
+            *(
+                ["ensure-debug-info-scope-on-llvm-func{emission-kind=LineTablesOnly}"]
+                if env.debug.enable_debug_info
+                else []
+            ),
+        ]
+        binary_fragment = f'gpu-module-to-binary{{format=fatbin opts="{" ".join(bin_cli_opts)}"}}'
+        return [*pre_binary_fragments, *binary_prep_fragments], binary_fragment
+
+    def pipeline_fragments(self, *, compile_hints: dict) -> List[str]:
+        pre_binary_fragments, binary_fragment = self._pipeline_parts(compile_hints=compile_hints)
+        return [*pre_binary_fragments, binary_fragment]
+
+    def external_binary_pipeline_fragments(self, *, compile_hints: dict) -> Tuple[List[str], str]:
+        return self._pipeline_parts(compile_hints=compile_hints)
+
+    def lower_compile_hints(self, module, *, compile_hints: dict) -> None:
+        """Materialize a scalar waves-per-EU override on kernel entries."""
+        if compile_hints.get("maxnreg") is not None:
+            raise ValueError(
+                "maxnreg is not supported. It only ever reached LLVM through "
+                "gpu-module-to-binary opts=, which ROCDL never reads, so it has "
+                "been silently inert. The underlying amdgpu-num-vgpr attribute is "
+                "deprecated in LLVM ('use amdgpu-waves-per-eu instead') and is "
+                "silently doubled on gfx90a/gfx942/gfx950, where it is a combined "
+                "VGPR+AGPR budget rather than a VGPR cap. Use waves_per_eu to "
+                "target occupancy; see the `llvm` skill to verify it applied."
+            )
+
+        waves_per_eu = compile_hints.get("waves_per_eu")
+        if waves_per_eu is None:
+            return
+
+        wpe_str = _normalize_waves_per_eu(waves_per_eu)
+        if wpe_str is None:
+            return
+
+        with module.context:
+            from ..._mlir import ir as _ir
+
+            wpe_attr = _ir.StringAttr.get(wpe_str)
+            for func_op in _iter_gpu_kernel_funcs(module):
+                func_op.attributes["rocdl.waves_per_eu"] = wpe_attr
+
+    def gpu_module_targets(self) -> List[str]:
+        # Intentionally empty: the ROCm pipeline attaches the authoritative
+        # #rocdl.target via `rocdl-attach-target` (binary_prep_fragments),
+        # which carries the compile options (O, abi, fast/unsafe-math,
+        # wave64, link_libs). Attaching a bare target here as well made
+        # gpu-module-to-binary serialize one object per target and select the
+        # *bare* one (first object, no offloading handler) — doubling backend
+        # work and silently discarding compile options and link_libs
+        # (ROCm/FlyDSL#1054).
+        return []
+
+    # -- cache / fingerprint ---------------------------------------------
+
+    def native_lib_patterns(self) -> List[str]:
+        return [
+            "_mlirDialectsFly*.so",
+            "libFly*.so",
+            "libfly_rocm_aot_runtime.a",
+            "libfly_jit_runtime.so",
+            "libmlir_rocm_runtime.so",
+            "_mlirRegisterEverything*.so",
+        ]
+
+    def jit_runtime_lib_basenames(self) -> List[str]:
+        return [
+            "libfly_jit_runtime.so",
+            "libmlir_c_runner_utils.so",
+        ]
+
+    @classmethod
+    def aot_runtime_config(cls) -> AOTRuntimeConfig:
+        return AOTRuntimeConfig(
+            archive_basename="libfly_rocm_aot_runtime.a",
+            runtime_libraries=("libamdhip64.so",),
+            linker_flags=("-lamdhip64", "-pthread", "-ldl"),
+        )
+
+
+def _normalize_waves_per_eu(waves_per_eu) -> "str | None":
+    """Validate and normalize ``waves_per_eu`` to a ``"min,max"`` string.
+
+    Accepted forms:
+      int            – single minimum value, e.g. ``2`` → ``"2"``
+      (int, int)     – explicit (min, max), e.g. ``(1, 1)`` → ``"1,1"``
+      str            – pre-formatted, e.g. ``"1,1"`` passed through as-is
+
+    Returns *None* when the effective value is zero (no-op).
+    """
+    if isinstance(waves_per_eu, bool):
+        raise TypeError(f"waves_per_eu must be an int, tuple(int, int), or str, got {waves_per_eu!r}")
+
+    if isinstance(waves_per_eu, int):
+        if waves_per_eu < 0:
+            raise ValueError(f"waves_per_eu must be >= 0, got {waves_per_eu}")
+        return None if waves_per_eu == 0 else str(waves_per_eu)
+
+    if isinstance(waves_per_eu, (tuple, list)):
+        if len(waves_per_eu) != 2 or not all(isinstance(v, int) and not isinstance(v, bool) for v in waves_per_eu):
+            raise TypeError(f"waves_per_eu tuple must be (int, int), got {waves_per_eu!r}")
+        lo, hi = waves_per_eu
+        if lo < 0 or hi < 0:
+            raise ValueError(f"waves_per_eu values must be >= 0, got {waves_per_eu!r}")
+        if lo > hi:
+            raise ValueError(f"waves_per_eu min ({lo}) must be <= max ({hi})")
+        return f"{lo},{hi}"
+
+    if isinstance(waves_per_eu, str):
+        # Parse and validate the same way as a tuple so that "2,1" and "abc"
+        # are caught here instead of failing deep inside LLVM codegen.
+        parts = waves_per_eu.split(",")
+        if len(parts) not in (1, 2):
+            raise ValueError(f'waves_per_eu string must be "min" or "min,max", got {waves_per_eu!r}')
+        try:
+            vals = [int(p) for p in parts]
+        except ValueError:
+            raise ValueError(f"waves_per_eu string must contain integers, got {waves_per_eu!r}") from None
+        if any(v < 0 for v in vals):
+            raise ValueError(f"waves_per_eu values must be >= 0, got {waves_per_eu!r}")
+        if len(vals) == 2 and vals[0] > vals[1]:
+            raise ValueError(f"waves_per_eu min ({vals[0]}) must be <= max ({vals[1]})")
+        return None if vals == [0] else ",".join(str(v) for v in vals)
+
+    raise TypeError(f"waves_per_eu must be an int, tuple(int, int), or str, got {type(waves_per_eu).__name__}")
+
+
+def _iter_gpu_kernel_funcs(module):
+    """Yield entry ``gpu.func`` ops, excluding device helpers."""
+    for top in module.body.operations:
+        if top.operation.name != "gpu.module":
+            continue
+        for op in top.regions[0].blocks[0].operations:
+            if op.operation.name == "gpu.func" and ("kernel" in op.attributes or "gpu.kernel" in op.attributes):
+                yield op
+
+
+def _set_passthrough(func_op, key: str, value: str) -> None:
+    """Replace one LLVM passthrough key while preserving unrelated entries."""
+    from ..._mlir import ir
+
+    def _entry_key(entry):
+        try:
+            pair = ir.ArrayAttr(entry)
+            return ir.StringAttr(pair[0]).value if len(pair) else None
+        except (TypeError, ValueError):
+            return None
+
+    new_entry = ir.ArrayAttr.get([ir.StringAttr.get(key), ir.StringAttr.get(value)])
+    existing = func_op.attributes["passthrough"] if "passthrough" in func_op.attributes else None
+    kept = [entry for entry in existing if _entry_key(entry) != key] if existing is not None else []
+    func_op.attributes["passthrough"] = ir.ArrayAttr.get([*kept, new_entry])

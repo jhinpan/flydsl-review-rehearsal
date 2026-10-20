@@ -1,0 +1,24 @@
+# Standard static library - the ODR TypeID issue is worked around in FlyToROCDL.cpp
+# by using string-based type matching instead of dyn_cast when needed.
+add_mlir_dialect_library(MLIRFlyROCDLDialect
+  Dialect.cpp
+  Ops.cpp
+  CDNA3/MmaAtom.cpp
+  CDNA3/CopyAtom.cpp
+  CDNA4/MmaAtom.cpp
+  CDNA4/CopyAtom.cpp
+  CDNA5/CopyAtom.cpp
+  CDNA5/TdmGeometry.cpp
+  CDNA5/TdmAtomBuilder.cpp
+  Transforms/ExpandOps.cpp
+  Transforms/ClusterAttr.cpp
+  GFX1250/MmaAtom.cpp
+  GFX1250/MmaAtomScale.cpp
+  GFX1250/CopyAtom.cpp
+  GFX11/MmaAtom.cpp
+  GFX120X/MmaAtom.cpp
+
+  DEPENDS
+  MLIRFlyROCDLIncGen
+  FlyROCDLTransformPassIncGen
+)
